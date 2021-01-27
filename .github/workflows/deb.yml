@@ -5,13 +5,11 @@ on:
     branches:
       - master
       - v*
-    paths:
-      - "**/*.go"
   release:
     types: [prereleased]
 
 jobs:
-  build:
+  package:
     if: github.repository == 'v2fly/v2ray-core'
     runs-on: ubuntu-latest
     container: debian:sid
@@ -25,7 +23,7 @@ jobs:
       - name: Checkout codebase
         uses: actions/checkout@v2
         with:
-          submodules: 'recursive'
+          submodules: "recursive"
 
       - name: Install build dependencies
         run: |

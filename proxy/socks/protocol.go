@@ -1,15 +1,14 @@
-// +build !confonly
-
 package socks
 
 import (
 	"encoding/binary"
 	"io"
+	gonet "net"
 
-	"v2ray.com/core/common"
-	"v2ray.com/core/common/buf"
-	"v2ray.com/core/common/net"
-	"v2ray.com/core/common/protocol"
+	"github.com/v2fly/v2ray-core/v5/common"
+	"github.com/v2fly/v2ray-core/v5/common/buf"
+	"github.com/v2fly/v2ray-core/v5/common/net"
+	"github.com/v2fly/v2ray-core/v5/common/protocol"
 )
 
 const (
@@ -18,7 +17,7 @@ const (
 
 	cmdTCPConnect    = 0x01
 	cmdTCPBind       = 0x02
-	cmdUDPPort       = 0x03
+	cmdUDPAssociate  = 0x03
 	cmdTorResolve    = 0xF0
 	cmdTorResolvePTR = 0xF1
 
@@ -31,6 +30,7 @@ const (
 	authNoMatchingMethod = 0xFF
 
 	statusSuccess       = 0x00
+	statusConnRefused   = 0x05
 	statusCmdNotSupport = 0x07
 )
 
@@ -41,8 +41,11 @@ var addrParser = protocol.NewAddressParser(
 )
 
 type ServerSession struct {
-	config *ServerConfig
-	port   net.Port
+	config         *ServerConfig
+	address        net.Address
+	port           net.Port
+	clientAddress  net.Address
+	flushLastReply func(bool) error
 }
 
 func (s *ServerSession) handshake4(cmd byte, reader io.Reader, writer io.Writer) (*protocol.RequestHeader, error) {
@@ -84,7 +87,13 @@ func (s *ServerSession) handshake4(cmd byte, reader io.Reader, writer io.Writer)
 			Port:    port,
 			Version: socks4Version,
 		}
-		if err := writeSocks4Response(writer, socks4RequestGranted, net.AnyIP, net.Port(0)); err != nil {
+		if err := s.setupLastReply(func(ok bool) error {
+			if ok {
+				return writeSocks4Response(writer, socks4RequestGranted, net.AnyIP, net.Port(0))
+			} else {
+				return writeSocks4Response(writer, socks4RequestRejected, net.AnyIP, net.Port(0))
+			}
+		}); err != nil {
 			return nil, err
 		}
 		return request, nil
@@ -164,7 +173,7 @@ func (s *ServerSession) handshake5(nMethod byte, reader io.Reader, writer io.Wri
 	case cmdTCPConnect, cmdTorResolve, cmdTorResolvePTR:
 		// We don't have a solution for Tor case now. Simply treat it as connect command.
 		request.Command = protocol.RequestCommandTCP
-	case cmdUDPPort:
+	case cmdUDPAssociate:
 		if !s.config.UdpEnabled {
 			writeSocks5Response(writer, statusCmdNotSupport, net.AnyIP, net.Port(0))
 			return nil, newError("UDP is not enabled.")
@@ -187,21 +196,50 @@ func (s *ServerSession) handshake5(nMethod byte, reader io.Reader, writer io.Wri
 	request.Address = addr
 	request.Port = port
 
-	responseAddress := net.AnyIP
-	responsePort := net.Port(1717)
+	responseAddress := s.address
+	responsePort := s.port
+	//nolint:gocritic // Use if else chain for clarity
 	if request.Command == protocol.RequestCommandUDP {
-		addr := s.config.Address.AsAddress()
-		if addr == nil {
-			addr = net.LocalHostIP
+		if s.config.Address != nil {
+			// Use configured IP as remote address in the response to UdpAssociate
+			responseAddress = s.config.Address.AsAddress()
+		} else if s.clientAddress == net.LocalHostIP || s.clientAddress == net.LocalHostIPv6 {
+			// For localhost clients use loopback IP
+			responseAddress = s.clientAddress
+		} else {
+			// For non-localhost clients use inbound listening address
+			responseAddress = s.address
 		}
-		responseAddress = addr
-		responsePort = s.port
 	}
-	if err := writeSocks5Response(writer, statusSuccess, responseAddress, responsePort); err != nil {
+	if err := s.setupLastReply(func(ok bool) error {
+		if ok {
+			return writeSocks5Response(writer, statusSuccess, responseAddress, responsePort)
+		} else {
+			return writeSocks5Response(writer, statusConnRefused, net.AnyIP, net.Port(0))
+		}
+	}); err != nil {
 		return nil, err
 	}
 
 	return request, nil
+}
+
+// Sets the callback and calls or postpones it based on the boolean field
+func (s *ServerSession) setupLastReply(callback func(bool) error) error {
+	noOpCallback := func(bool) error {
+		return nil
+	}
+
+	// set the field even if we call it now because it will be called again
+	s.flushLastReply = func(ok bool) error {
+		s.flushLastReply = noOpCallback
+		return callback(ok)
+	}
+
+	if s.config.GetDeferLastReply() {
+		return nil
+	}
+	return s.flushLastReply(true)
 }
 
 // Handshake performs a Socks4/4a/5 handshake.
@@ -354,6 +392,17 @@ func EncodeUDPPacket(request *protocol.RequestHeader, data []byte) (*buf.Buffer,
 	return b, nil
 }
 
+func EncodeUDPPacketFromAddress(address net.Destination, data []byte) (*buf.Buffer, error) {
+	b := buf.New()
+	common.Must2(b.Write([]byte{0, 0, 0 /* Fragment */}))
+	if err := addrParser.WriteAddressPort(b, address.Address, address.Port); err != nil {
+		b.Release()
+		return nil, err
+	}
+	common.Must2(b.Write(data))
+	return b, nil
+}
+
 type UDPReader struct {
 	reader io.Reader
 }
@@ -371,6 +420,23 @@ func (r *UDPReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		return nil, err
 	}
 	return buf.MultiBuffer{b}, nil
+}
+
+func (r *UDPReader) ReadFrom(p []byte) (n int, addr gonet.Addr, err error) {
+	buffer := buf.New()
+	_, err = buffer.ReadFrom(r.reader)
+	if err != nil {
+		buffer.Release()
+		return 0, nil, err
+	}
+	req, err := DecodeUDPPacket(buffer)
+	if err != nil {
+		buffer.Release()
+		return 0, nil, err
+	}
+	n = copy(p, buffer.Bytes())
+	buffer.Release()
+	return n, &gonet.UDPAddr{IP: req.Address.IP(), Port: int(req.Port)}, nil
 }
 
 type UDPWriter struct {
@@ -398,7 +464,22 @@ func (w *UDPWriter) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func ClientHandshake(request *protocol.RequestHeader, reader io.Reader, writer io.Writer) (*protocol.RequestHeader, error) {
+func (w *UDPWriter) WriteTo(payload []byte, addr gonet.Addr) (n int, err error) {
+	request := *w.request
+	udpAddr := addr.(*gonet.UDPAddr)
+	request.Command = protocol.RequestCommandUDP
+	request.Address = net.IPAddress(udpAddr.IP)
+	request.Port = net.Port(udpAddr.Port)
+	packet, err := EncodeUDPPacket(&request, payload)
+	if err != nil {
+		return 0, err
+	}
+	_, err = w.writer.Write(packet.Bytes())
+	packet.Release()
+	return len(payload), err
+}
+
+func ClientHandshake(request *protocol.RequestHeader, reader io.Reader, writer io.Writer, delayAuthWrite bool) (*protocol.RequestHeader, error) {
 	authByte := byte(authNotRequired)
 	if request.User != nil {
 		authByte = byte(authPassword)
@@ -408,14 +489,15 @@ func ClientHandshake(request *protocol.RequestHeader, reader io.Reader, writer i
 	defer b.Release()
 
 	common.Must2(b.Write([]byte{socks5Version, 0x01, authByte}))
-	if authByte == authPassword {
-		account := request.User.Account.(*Account)
-
-		common.Must(b.WriteByte(0x01))
-		common.Must(b.WriteByte(byte(len(account.Username))))
-		common.Must2(b.WriteString(account.Username))
-		common.Must(b.WriteByte(byte(len(account.Password))))
-		common.Must2(b.WriteString(account.Password))
+	if !delayAuthWrite {
+		if authByte == authPassword {
+			account := request.User.Account.(*Account)
+			common.Must(b.WriteByte(0x01))
+			common.Must(b.WriteByte(byte(len(account.Username))))
+			common.Must2(b.WriteString(account.Username))
+			common.Must(b.WriteByte(byte(len(account.Password))))
+			common.Must2(b.WriteString(account.Password))
+		}
 	}
 
 	if err := buf.WriteAllBytes(writer, b.Bytes()); err != nil {
@@ -436,6 +518,18 @@ func ClientHandshake(request *protocol.RequestHeader, reader io.Reader, writer i
 
 	if authByte == authPassword {
 		b.Clear()
+		if delayAuthWrite {
+			account := request.User.Account.(*Account)
+			common.Must(b.WriteByte(0x01))
+			common.Must(b.WriteByte(byte(len(account.Username))))
+			common.Must2(b.WriteString(account.Username))
+			common.Must(b.WriteByte(byte(len(account.Password))))
+			common.Must2(b.WriteString(account.Password))
+			if err := buf.WriteAllBytes(writer, b.Bytes()); err != nil {
+				return nil, err
+			}
+			b.Clear()
+		}
 		if _, err := b.ReadFullFrom(reader, 2); err != nil {
 			return nil, err
 		}
@@ -448,7 +542,7 @@ func ClientHandshake(request *protocol.RequestHeader, reader io.Reader, writer i
 
 	command := byte(cmdTCPConnect)
 	if request.Command == protocol.RequestCommandUDP {
-		command = byte(cmdUDPPort)
+		command = byte(cmdUDPAssociate)
 	}
 	common.Must2(b.Write([]byte{socks5Version, command, 0x00 /* reserved */}))
 	if err := addrParser.WriteAddressPort(b, request.Address, request.Port); err != nil {
@@ -487,4 +581,47 @@ func ClientHandshake(request *protocol.RequestHeader, reader io.Reader, writer i
 	}
 
 	return nil, nil
+}
+
+func ClientHandshake4(request *protocol.RequestHeader, reader io.Reader, writer io.Writer) error {
+	b := buf.New()
+	defer b.Release()
+
+	common.Must2(b.Write([]byte{socks4Version, cmdTCPConnect}))
+	portBytes := b.Extend(2)
+	binary.BigEndian.PutUint16(portBytes, request.Port.Value())
+	switch request.Address.Family() {
+	case net.AddressFamilyIPv4:
+		common.Must2(b.Write(request.Address.IP()))
+	case net.AddressFamilyDomain:
+		common.Must2(b.Write([]byte{0x00, 0x00, 0x00, 0x01}))
+	case net.AddressFamilyIPv6:
+		return newError("ipv6 is not supported in socks4")
+	default:
+		panic("Unknown family type.")
+	}
+	if request.User != nil {
+		account := request.User.Account.(*Account)
+		common.Must2(b.WriteString(account.Username))
+	}
+	common.Must(b.WriteByte(0x00))
+	if request.Address.Family() == net.AddressFamilyDomain {
+		common.Must2(b.WriteString(request.Address.Domain()))
+		common.Must(b.WriteByte(0x00))
+	}
+	if err := buf.WriteAllBytes(writer, b.Bytes()); err != nil {
+		return err
+	}
+
+	b.Clear()
+	if _, err := b.ReadFullFrom(reader, 8); err != nil {
+		return err
+	}
+	if b.Byte(0) != 0x00 {
+		return newError("unexpected version of the reply code: ", b.Byte(0))
+	}
+	if b.Byte(1) != socks4RequestGranted {
+		return newError("server rejects request: ", b.Byte(1))
+	}
+	return nil
 }

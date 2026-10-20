@@ -1,10 +1,15 @@
 // Package dice contains common functions to generate random number.
 // It also initialize math/rand with the time in seconds at launch time.
-package dice // import "v2ray.com/core/common/dice"
+package dice
 
 import (
+	crand "crypto/rand"
+	"io"
+	"math/big"
 	"math/rand"
 	"time"
+
+	"github.com/v2fly/v2ray-core/v5/common"
 )
 
 // Roll returns a non-negative number between 0 (inclusive) and n (exclusive).
@@ -13,6 +18,17 @@ func Roll(n int) int {
 		return 0
 	}
 	return rand.Intn(n)
+}
+
+// RollWith returns a non-negative number between 0 (inclusive) and n (exclusive).
+// Use random as the random source, if read fails, it panics.
+func RollWith(n int, random io.Reader) int {
+	if n == 1 {
+		return 0
+	}
+	mrand, err := crand.Int(random, big.NewInt(int64(n)))
+	common.Must(err)
+	return int(mrand.Int64())
 }
 
 // Roll returns a non-negative number between 0 (inclusive) and n (exclusive).

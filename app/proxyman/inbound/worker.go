@@ -6,21 +6,23 @@ import (
 	"sync/atomic"
 	"time"
 
-	"v2ray.com/core/app/proxyman"
-	"v2ray.com/core/common"
-	"v2ray.com/core/common/buf"
-	"v2ray.com/core/common/net"
-	"v2ray.com/core/common/serial"
-	"v2ray.com/core/common/session"
-	"v2ray.com/core/common/signal/done"
-	"v2ray.com/core/common/task"
-	"v2ray.com/core/features/routing"
-	"v2ray.com/core/features/stats"
-	"v2ray.com/core/proxy"
-	"v2ray.com/core/transport/internet"
-	"v2ray.com/core/transport/internet/tcp"
-	"v2ray.com/core/transport/internet/udp"
-	"v2ray.com/core/transport/pipe"
+	"github.com/v2fly/v2ray-core/v5/app/proxyman"
+	"github.com/v2fly/v2ray-core/v5/common"
+	"github.com/v2fly/v2ray-core/v5/common/buf"
+	"github.com/v2fly/v2ray-core/v5/common/environment"
+	"github.com/v2fly/v2ray-core/v5/common/environment/envctx"
+	"github.com/v2fly/v2ray-core/v5/common/net"
+	"github.com/v2fly/v2ray-core/v5/common/serial"
+	"github.com/v2fly/v2ray-core/v5/common/session"
+	"github.com/v2fly/v2ray-core/v5/common/signal/done"
+	"github.com/v2fly/v2ray-core/v5/common/task"
+	"github.com/v2fly/v2ray-core/v5/features/routing"
+	"github.com/v2fly/v2ray-core/v5/features/stats"
+	"github.com/v2fly/v2ray-core/v5/proxy"
+	"github.com/v2fly/v2ray-core/v5/transport/internet"
+	"github.com/v2fly/v2ray-core/v5/transport/internet/tcp"
+	"github.com/v2fly/v2ray-core/v5/transport/internet/udp"
+	"github.com/v2fly/v2ray-core/v5/transport/pipe"
 )
 
 type worker interface {
@@ -87,6 +89,7 @@ func (w *tcpWorker) callback(conn internet.Connection) {
 	if w.sniffingConfig != nil {
 		content.SniffingRequest.Enabled = w.sniffingConfig.Enabled
 		content.SniffingRequest.OverrideDestinationForProtocol = w.sniffingConfig.DestinationOverride
+		content.SniffingRequest.MetadataOnly = w.sniffingConfig.MetadataOnly
 	}
 	ctx = session.ContextWithContent(ctx, content)
 	if w.uplinkCounter != nil || w.downlinkCounter != nil {
@@ -110,7 +113,13 @@ func (w *tcpWorker) Proxy() proxy.Inbound {
 }
 
 func (w *tcpWorker) Start() error {
-	ctx := context.Background()
+	ctx := w.ctx
+	proxyEnvironment := envctx.EnvironmentFromContext(w.ctx).(environment.ProxyEnvironment)
+	transportEnvironment, err := proxyEnvironment.NarrowScopeToTransport("transport")
+	if err != nil {
+		return newError("unable to narrow environment to transport").Base(err)
+	}
+	ctx = envctx.ContextWithEnvironment(ctx, transportEnvironment)
 	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, func(conn internet.Connection) {
 		go w.callback(conn)
 	})
@@ -152,6 +161,11 @@ type udpConn struct {
 	done             *done.Instance
 	uplink           stats.Counter
 	downlink         stats.Counter
+	inactive         bool
+}
+
+func (c *udpConn) setInactive() {
+	c.inactive = true
 }
 
 func (c *udpConn) updateActivity() {
@@ -230,11 +244,14 @@ type udpWorker struct {
 	tag             string
 	stream          *internet.MemoryStreamConfig
 	dispatcher      routing.Dispatcher
+	sniffingConfig  *proxyman.SniffingConfig
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
 	checker    *task.Periodic
 	activeConn map[connID]*udpConn
+
+	ctx context.Context
 }
 
 func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
@@ -286,7 +303,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 		common.Must(w.checker.Start())
 
 		go func() {
-			ctx := context.Background()
+			ctx := w.ctx
 			sid := session.NewID()
 			ctx = session.ContextWithID(ctx, sid)
 
@@ -300,11 +317,22 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 				Gateway: net.UDPDestination(w.address, w.port),
 				Tag:     w.tag,
 			})
+			content := new(session.Content)
+			if w.sniffingConfig != nil {
+				content.SniffingRequest.Enabled = w.sniffingConfig.Enabled
+				content.SniffingRequest.OverrideDestinationForProtocol = w.sniffingConfig.DestinationOverride
+				content.SniffingRequest.MetadataOnly = w.sniffingConfig.MetadataOnly
+			}
+			ctx = session.ContextWithContent(ctx, content)
 			if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
 				newError("connection ends").Base(err).WriteToLog(session.ExportIDToError(ctx))
 			}
 			conn.Close()
-			w.removeConn(id)
+			// conn not removed by checker TODO may be lock worker here is better
+			if !conn.inactive {
+				conn.setInactive()
+				w.removeConn(id)
+			}
 		}()
 	}
 }
@@ -333,7 +361,10 @@ func (w *udpWorker) clean() error {
 
 	for addr, conn := range w.activeConn {
 		if nowSec-atomic.LoadInt64(&conn.lastActivityTime) > 8 { // TODO Timeout too small
-			delete(w.activeConn, addr)
+			if !conn.inactive {
+				conn.setInactive()
+				delete(w.activeConn, addr)
+			}
 			conn.Close()
 		}
 	}
@@ -348,6 +379,12 @@ func (w *udpWorker) clean() error {
 func (w *udpWorker) Start() error {
 	w.activeConn = make(map[connID]*udpConn, 16)
 	ctx := context.Background()
+	proxyEnvironment := envctx.EnvironmentFromContext(w.ctx).(environment.ProxyEnvironment)
+	transportEnvironment, err := proxyEnvironment.NarrowScopeToTransport("transport")
+	if err != nil {
+		return newError("unable to narrow environment to transport").Base(err)
+	}
+	ctx = envctx.ContextWithEnvironment(ctx, transportEnvironment)
 	h, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, udp.HubCapacity(256))
 	if err != nil {
 		return err
@@ -428,6 +465,7 @@ func (w *dsWorker) callback(conn internet.Connection) {
 	if w.sniffingConfig != nil {
 		content.SniffingRequest.Enabled = w.sniffingConfig.Enabled
 		content.SniffingRequest.OverrideDestinationForProtocol = w.sniffingConfig.DestinationOverride
+		content.SniffingRequest.MetadataOnly = w.sniffingConfig.MetadataOnly
 	}
 	ctx = session.ContextWithContent(ctx, content)
 	if w.uplinkCounter != nil || w.downlinkCounter != nil {
@@ -453,8 +491,15 @@ func (w *dsWorker) Proxy() proxy.Inbound {
 func (w *dsWorker) Port() net.Port {
 	return net.Port(0)
 }
+
 func (w *dsWorker) Start() error {
 	ctx := context.Background()
+	proxyEnvironment := envctx.EnvironmentFromContext(w.ctx).(environment.ProxyEnvironment)
+	transportEnvironment, err := proxyEnvironment.NarrowScopeToTransport("transport")
+	if err != nil {
+		return newError("unable to narrow environment to transport").Base(err)
+	}
+	ctx = envctx.ContextWithEnvironment(ctx, transportEnvironment)
 	hub, err := internet.ListenUnix(ctx, w.address, w.stream, func(conn internet.Connection) {
 		go w.callback(conn)
 	})

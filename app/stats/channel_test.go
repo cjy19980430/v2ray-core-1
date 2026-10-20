@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	. "v2ray.com/core/app/stats"
-	"v2ray.com/core/common"
-	"v2ray.com/core/features/stats"
+	. "github.com/v2fly/v2ray-core/v5/app/stats"
+	"github.com/v2fly/v2ray-core/v5/common"
+	"github.com/v2fly/v2ray-core/v5/features/stats"
 )
 
 func TestStatsChannel(t *testing.T) {
@@ -203,7 +203,7 @@ func TestStatsChannelBlocking(t *testing.T) {
 
 	// Test blocking channel publishing
 	go func() {
-		// Dummy messsage with no subscriber receiving, will block broadcasting goroutine
+		// Dummy message with no subscriber receiving, will block broadcasting goroutine
 		c.Publish(context.Background(), nil)
 
 		<-pauseCh

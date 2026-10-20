@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"v2ray.com/core/common/net"
+	"github.com/v2fly/v2ray-core/v5/common/net"
 )
 
 // ParseXForwardedFor parses X-Forwarded-For header in http headers, and return the IP list in it.
@@ -35,6 +35,7 @@ func RemoveHopByHopHeaders(header http.Header) {
 	header.Del("Trailers")
 	header.Del("Transfer-Encoding")
 	header.Del("Upgrade")
+	header.Del("Keep-Alive")
 
 	connections := header.Get("Connection")
 	header.Del("Connection")
@@ -57,7 +58,7 @@ func ParseHost(rawHost string, defaultPort net.Port) (net.Destination, error) {
 			return net.Destination{}, err
 		}
 	} else if len(rawPort) > 0 {
-		intPort, err := strconv.Atoi(rawPort)
+		intPort, err := strconv.ParseUint(rawPort, 0, 16)
 		if err != nil {
 			return net.Destination{}, err
 		}
